@@ -6,6 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-20
+
+### Changed
+- **The engine floor moves to firefox-33.** It is the first build where a drag
+  gesture is delivered, where a gesture interrupted by a navigation does not
+  leave the page dead to the pointer, and where the renderer acks every mouse
+  event it handles - the ack this driver's questions about input rest on, and
+  the one the engine had lost in its port to Firefox 150.
+
+  On the drag: until now the pinned engine sent its mouse events through a
+  door that could not dispatch `dragover` at all, and then lost the
+  acknowledgement that upstream used to await, so a drag born in the gap
+  between two calls went unnoticed. Measured against the previous engine, a
+  humanised journey opened 0 drag sessions out of 20; against this one, 5 out
+  of 5, and the dose-response on the pause between events went from 5
+  deliveries out of 24 to 24 out of 24, which is the threshold disappearing
+  rather than moving. Nothing in this package changed to get that: the pin
+  carries it, and a consumer only ever runs the engine its seal names.
+
+  The 0.22.3 that was prepared and never published pinned firefox-32, a build
+  that delivered the drag and, under load, failed clicks more often than the
+  engine it replaced - measured on the same runners, the same day: 0 red runs
+  out of 6 before, 1 out of 4 with that engine alone. That is the defect the
+  entry below closes, and it is why that version went out as this one instead.
+
+### Fixed
+- **Under load, a humanised movement no longer collapses into a jump.** The
+  pacer drops an event whose successor is already due rather than sending it
+  late, and that rule had no ceiling in space: on a loaded machine nearly every
+  point was overtaken, the destination survived, and one event carried 89% of
+  an 820 px journey with a timestamp exactly where the plan put it. Now an
+  event is dropped only while the one after it lies within twice the plan's
+  largest step of the last position sent; past that it goes out late, still no
+  closer to the previous one than the 8 ms floor, and the movement overruns
+  its budget by however much the machine is behind. The one overslept sample
+  the Windows timer produces is still dropped, and the plan still ends on
+  time. Both drivers now tell the pacer where the pointer starts, so the first
+  drops are measured from where it really is.
+- **A pointer action that did not reach its element no longer reports
+  success.** `hover`, `click`, `check` and `uncheck` now ask the engine where
+  each event actually landed, as recorded at dispatch by a privileged listener
+  the page cannot see, and raise `ActionMissed` when the move, the press or
+  the release fell on something else. Measured on a target that moves: `hover`
+  returned normally 2 times out of 8 and `click` 8 times out of 8 with the
+  page having seen no event at all. The miss is reported, not retried - the
+  press happened, and repeating it is the defect the retry loop exists to
+  prevent. `force` skips this as it skips the hit-target check. Requires an
+  engine that answers `Page.pointerLanded` and returns an `eventId` from
+  `Page.dispatchMouseEvent`: the question carries the id of the last event the
+  action sent and the engine waits for the renderer's ack of it before it
+  looks, because a `mousemove` is coalesced and dispatched at the next refresh
+  tick, after a question sent right behind it.
+- **The e2e test that asserted a `hover` reaches the page through a handle
+  asserted an entrance, not a move.** It listened for `mouseover`, which fires
+  only when the pointer enters the element, and did not control where the
+  previous action had left the pointer; whether it passed depended on the
+  humanised path of the action before it. It now says what it means. This was
+  the red that appeared on runs whose whole diff was a data file, and it was
+  the test, not the driver.
+
 ## [0.22.2] - 2026-09-18
 
 ### Fixed
