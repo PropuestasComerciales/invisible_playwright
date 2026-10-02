@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.25.8] - 2026-10-02
+
+### Fixed
+- **`expect_navigation()` and `wait_for_url()` no longer crash on a new
+  document.** Every navigation event announced its document with a request
+  of `None`, a value Playwright's protocol does not allow there, and the
+  client died on it with `AttributeError: 'NoneType' object has no attribute
+  '_object'`. The event now carries the navigation's request, or no request
+  when there was none (`about:blank`), and after a redirect
+  `expect_navigation().value` is the final response.
+- **A same-document navigation now reaches the client.** A `pushState`, a
+  hash change or the route change of a single-page application arrives from
+  the engine as `Page.sameDocumentNavigation`, and the server updated its own
+  record of the frame and sent nothing up: `page.url` kept the URL of the
+  last full load, `wait_for_url` never resolved and `framenavigated` never
+  fired. A click that worked therefore timed out, on every site that routes
+  in the client rather than reloading. The event now goes up as a `navigated`
+  without a `newDocument`, the shape upstream sends, so the client tells it
+  from a full load the way it always did.
+- **Locators and handles work through nested cross-origin frames.** A
+  locator two frames deep found its element and then read it in the wrong
+  frame: `inner_text` answered "Cannot find object", `bounding_box`,
+  `select_option` and `scroll_into_view_if_needed` matched nothing, and a
+  handle from `wait_for_selector` belonged to the top frame.
+  `frame.parent_frame` is no longer None, `frame.frame_element()` answers
+  instead of refusing, and `frame.url` and the frame's load states follow
+  every new document instead of the last `goto`.
+- **A humanised click lands off-centre in a nested frame and inside a shadow
+  root.** The cursor checked its chosen point with its own hit test, at the
+  top frame's coordinates and blind to shadow roots, so it rejected every
+  off-centre point there and the click went to the exact geometric centre of
+  the element, the same point in every install. The cursor now asks the check
+  the action itself makes before it presses.
+- **`fill('')` and `clear()` empty the field.** On a text input, a textarea
+  or a contenteditable, the injected script only selects the text when the
+  value is empty, and `fill` then asked the engine for bare `input`/`change`
+  events: the page heard about a change while the old text stayed, a
+  contenteditable got a `change` no user can produce, and inside a shadow
+  root the request failed with `NS_ERROR_UNEXPECTED`. It now presses
+  `Delete`, as Playwright does: the page gets the trusted `InputEvent`
+  (`deleteContentForward`) a user's Delete gives, and `change` waits for blur.
+- **`set_input_files`, `focus`, `blur` and `dispatch_event` work on a hidden
+  element.** Each asked the element for a point it never uses, and an element
+  with `display:none` has none, so the action timed out: a file chooser
+  opened from the usual styled button in front of a hidden
+  `<input type=file>` could not receive its files through `set_files` or
+  `set_input_files`. The four act on a hidden element now, as they do in
+  Playwright.
+- **`set_input_files` with content instead of a path uploads that content.**
+  A `{"name", "mimeType", "buffer"}` payload was read as nothing at all: the
+  input was cleared, `change` fired with no files, and the call returned as
+  if it had worked. The payload now reaches the page as a file with its name
+  and its bytes, through the same path as a file on disk, so its type is the
+  one Firefox gives that name, as for a file a user picks. A folder, which
+  the engine cannot take, is refused with a message that says so.
+
 ## [0.25.7] - 2026-09-25
 
 ### Fixed

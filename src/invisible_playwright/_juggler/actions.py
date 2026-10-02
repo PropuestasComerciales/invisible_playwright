@@ -229,8 +229,24 @@ class Actions:
                timeout: float = 30.0, frame_id: Optional[str] = None,
                position=None, element_id: Optional[str] = None,
                trial: bool = False, strict: bool = False,
-               force: bool = False):
+               force: bool = False, needs_point: bool = True):
         """Resolve, check, act, and if something doesn't match, START OVER.
+
+        ⛔ `needs_point=False` IS FOR AN ACTION THAT DOES NOT TOUCH THE SCREEN.
+        Setting a file input's files goes through the engine, not the pointer,
+        and the input it is aimed at is usually HIDDEN - a styled button in
+        front of an `<input type=file>` with `display:none`. Asking that input
+        for a quad answered "it isn't visible" on every turn until the
+        timeout, so an upload to the commonest upload widget there is could
+        not happen through either door, `set_input_files` or a file chooser's
+        `set_files`. Such an action gets the element and no point: no scroll,
+        no hit test, nothing a hidden element cannot satisfy.
+
+        ⛔ AND IT IS A PROPERTY OF THE ACTION, NOT OF FILE INPUTS: every action
+        whose `states` are empty declared that it needs no visibility, and the
+        quad put the requirement back. `focus`, `blur` and `dispatch_event` on
+        a `display:none` element timed out the same way, 4 s out of 4, where
+        Playwright performs all three; they pass `needs_point=False` too.
 
         ⛔ `position` travels HERE and not through each action, because the
         point is recomputed on every turn of this loop: an offset applied by
@@ -289,6 +305,10 @@ class Actions:
                 else:
                     element_ok = True
 
+                if element and element_ok and not needs_point:
+                    if trial:
+                        return None
+                    return run(f, element, None)
                 if element and element_ok:
                     # ⛔ SCROLL FIRST, and only when the point is not usable.
                     # Actionability says "visible", which is true of an element
@@ -336,8 +356,7 @@ class Actions:
                         # would actually ask, and `trial=True, force=True` asks
                         # whether a FORCED action would go through.
                         if not force:
-                            verdict = self.inj.check_hit_target(
-                                f, element, self._hit_point(f, point))
+                            verdict = self.hit_target(f, element, point)
                             if verdict != "done":
                                 raise WrongHitTarget(verdict)
                         return None
@@ -386,6 +405,21 @@ class Actions:
             time.sleep(0.05)
 
     # ── the hit target ──────────────────────────────────────────────────────
+    def hit_target(self, f, element, point) -> str:
+        """Does a MAIN-FRAME point land on `element`? `"done"`, or what is there.
+
+        ⛔ ONE QUESTION, ONE ANSWER, THREE ASKERS: the trial, the check before
+        a commit, and the humanised cursor choosing an off-centre landing
+        (`ElementHandle.checkHitTarget`). The cursor used to answer it on its
+        own with `document.elementFromPoint` at main-frame coordinates, which
+        is wrong twice: inside a nested frame the number means another place,
+        and inside a shadow root the hit is the host, never the control. Both
+        made every landing fail its check and fall back to the exact geometric
+        centre - one number for every click. Asking here means the cursor
+        accepts exactly the points the action itself would accept.
+        """
+        return self.inj.check_hit_target(f, element, self._hit_point(f, point))
+
     def _hit_point(self, f, point):
         """The caller's point, expressed in `f`'s own coordinate space.
 
@@ -485,8 +519,7 @@ class Actions:
         """
         approach()
         if not force:
-            verdict = self.inj.check_hit_target(f, element,
-                                                self._hit_point(f, point))
+            verdict = self.hit_target(f, element, point)
             if verdict != "done":
                 raise WrongHitTarget(verdict)
         result = commit()
@@ -511,7 +544,8 @@ class Actions:
 
     # ── waiting ─────────────────────────────────────────────────────────────
     def wait_for_selector(self, selector: str, *, state: str = "visible",
-                          timeout: float = 30.0, frame_id: Optional[str] = None):
+                          timeout: float = 30.0, frame_id: Optional[str] = None,
+                          strict: bool = False):
         """Waits for a selector to reach a state, and returns its handle.
 
         ⛔ THE HANDLE IS NOT DISPOSED HERE, and that is deliberate: the caller
@@ -532,7 +566,7 @@ class Actions:
         deadline = time.monotonic() + timeout
         reason = "not tried yet"
         while True:
-            element = self.inj.query_selector(frame, selector)
+            element = self.inj.query_selector(frame, selector, strict=strict)
             if state == "detached":
                 if not element:
                     return None
@@ -675,7 +709,7 @@ class Actions:
                 f, "(injected, el) => injected.focusNode(el, true)",
                 {"objectId": element})
         return self._retry(selector, run, states=[], timeout=timeout, frame_id=frame_id,
-                           element_id=element_id, **opts)
+                           element_id=element_id, needs_point=False, **opts)
 
     def blur(self, selector: str, *, timeout: float = 30.0,
              frame_id: Optional[str] = None, **opts):
@@ -686,7 +720,7 @@ class Actions:
                 "'error:notconnected'; el.blur(); return 'done'; }",
                 {"objectId": element})
         return self._retry(selector, run, states=[], timeout=timeout, frame_id=frame_id,
-                           **opts)
+                           needs_point=False, **opts)
 
     def select_text(self, selector: str, *, timeout: float = 30.0,
                     frame_id: Optional[str] = None, **opts):
@@ -743,7 +777,7 @@ class Actions:
                 f, "(injected, el, t, d) => injected.dispatchEvent(el, t, d)",
                 {"objectId": element}, event_type, detail or {})
         return self._retry(selector, run, states=[], timeout=timeout, frame_id=frame_id,
-                           **opts)
+                           needs_point=False, **opts)
 
     def press(self, selector: str, key: str, *, timeout: float = 30.0,
               frame_id: Optional[str] = None,
@@ -802,7 +836,8 @@ class Actions:
                         session=self.session, timeout=30)
             return list(files)
         return self._retry(selector, run, states=[], timeout=timeout,
-                           frame_id=frame_id, element_id=element_id, **opts)
+                           frame_id=frame_id, element_id=element_id,
+                           needs_point=False, **opts)
 
     def tap(self, selector: str, *, timeout: float = 30.0, frame_id: Optional[str] = None,
             position=None, **opts):
@@ -1027,10 +1062,15 @@ class Actions:
                 if text:
                     self._type(text)
                 else:
-                    # Clearing a field doesn't generate keystrokes: the
-                    # events still need to be requested, or the page
-                    # doesn't know it changed.
-                    self._trusted_events(f, element, ["input", "change"])
+                    # ⛔ Clearing is a keystroke, as in Playwright: the
+                    # injected script only SELECTED the text, so `Delete`
+                    # is what empties it, and the page gets the `InputEvent`
+                    # a user's Delete gives (`deleteContentForward`). This
+                    # used to request bare `input`/`change` instead: the
+                    # text stayed in the field, a contenteditable heard a
+                    # `change` no user can produce, and inside a shadow root
+                    # firefox-34 refused the request (NS_ERROR_UNEXPECTED).
+                    self.keyboard.press("Delete")
             else:
                 self._trusted_events(f, element, ["input", "change"])
             return result

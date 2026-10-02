@@ -26,9 +26,11 @@ hard failure. Everything here creates first and returns the channel second.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
+import shutil
 import tempfile
 import threading
 import time
@@ -228,23 +230,48 @@ def _launch_environment(named) -> Dict[str, str]:
     return {e["name"]: e["value"] for e in named}
 
 
-def _upload_paths(params: Dict) -> list:
-    """The local paths out of a `setInputFiles` request.
+def _upload_paths(server: "JugglerServer", params: Dict) -> list:
+    """The local paths a `setInputFiles` request stands for.
 
     ⛔ ONE READER, because there are two senders. The same request arrives at
     the Frame (a selector) and at the ElementHandle (a chooser already holding
-    the input), and the wire shape is the same for both: `localPaths` today,
-    `files` on older clients, and each entry is either a string or a `{name}`
-    object. Two dispatchers each unpacking that by hand is two places that know
-    one fact, and the second one is always the one that falls behind.
+    the input), and the wire shape is the same for both. Two dispatchers each
+    unpacking that by hand is two places that know one fact, and the second
+    one is always the one that falls behind.
 
-    What it deliberately does NOT read is `payloads` and `streams`: those are
-    the upload path where the CLIENT carries the bytes, which is
-    `createTempFiles` and is outside this package's perimeter by decision.
+    ⛔ THREE SHAPES, AND ONLY ONE WAS READ. The client sends `localPaths` for
+    files, `localDirectory` for a folder (`<input webkitdirectory>`), and
+    `payloads` - name, MIME type and base64 bytes - when the caller hands
+    over content instead of a path. Only `localPaths` was read, so the other
+    two became an EMPTY upload: the input was cleared, `change` fired with
+    no files, and the call returned as if it had worked. Measured on 0.25.7:
+    a payload `note.txt` arrived as `files.length == 0`.
+
+    A payload is written to a file this session owns and goes through the
+    same engine command as a path, so the page receives it the way it
+    receives a file a user picked - and, as for a user's pick, Firefox derives
+    the file's type from its name; the payload's `mimeType` is not carried.
+    `streams` are the remote-connection path (`createTempFiles`), outside the
+    perimeter by decision; this client never sends them to a local server.
+
+    ⛔ A FOLDER IS REFUSED, BY NAME. The engine's `Page.setFileInputFiles`
+    takes files: handed the folder's path it took the TAB down (the next call
+    answered "cannot find session"), measured on firefox-34 and on the engine
+    after it. Read as an empty list, as before, the engine answered with an
+    exception naming neither the folder nor the reason. Both are worse than
+    saying it.
     """
-    raw = params.get("localPaths") or params.get("files") or []
-    return [entry.get("name") if isinstance(entry, dict) else entry
-            for entry in raw]
+    directory = params.get("localDirectory")
+    if directory:
+        raise ProtocolException(
+            "set_input_files with a folder (%s) is not supported: the engine "
+            "takes files, so pass the files inside it instead" % directory)
+    raw = params.get("localPaths") or params.get("files")
+    if raw:
+        return [entry.get("name") if isinstance(entry, dict) else entry
+                for entry in raw]
+    return [server.stage_upload(payload)
+            for payload in params.get("payloads") or []]
 
 
 class ElementHandleDispatcher(Dispatcher):
@@ -252,6 +279,7 @@ class ElementHandleDispatcher(Dispatcher):
     METHODS = {
         "dispose": "op_dispose",
         "boundingBox": "op_bounding_box",
+        "checkHitTarget": "op_check_hit_target",
         "evaluateExpression": "op_evaluate",
         "textContent": "op_text_content",
         "innerText": "op_inner_text",
@@ -333,6 +361,21 @@ class ElementHandleDispatcher(Dispatcher):
     def op_bounding_box(self, params: Dict) -> Any:
         return {"value": self.injected.bounding_box(
             self.frame.frame_id, self.object_id)}
+
+    def op_check_hit_target(self, params: Dict) -> Any:
+        """Would an event at this MAIN-FRAME point land on this element?
+
+        ⛔ NOT A PLAYWRIGHT METHOD: the humanised cursor (`_cursor._hits`) is
+        its only caller, asking about the off-centre point it is about to aim
+        at. The point is in the space `boundingBox` answers in, and the answer
+        is the one the action's own check gives (`Actions.hit_target`): the
+        same frame shift, the same shadow-aware test. A second hit test here
+        would be a second definition of where a click lands.
+        """
+        point = params["point"]
+        return {"value": self.page.actions.hit_target(
+            self.frame.frame_id, self.object_id,
+            (float(point["x"]), float(point["y"]))) == "done"}
 
     def op_evaluate(self, params: Dict) -> Any:
         """`handle.evaluate(fn, arg)` - and the SECOND argument is the point.
@@ -584,8 +627,9 @@ class ElementHandleDispatcher(Dispatcher):
         Same action as the Frame's, same helper reading the request: one
         upload, not two.
         """
-        self.frame.actions.set_input_files(_HANDLE, _upload_paths(params),
-                                           **self._act_args(params))
+        self.frame.actions.set_input_files(
+            _HANDLE, _upload_paths(self.server, params),
+            **self._act_args(params))
         return None
 
 class FrameDispatcher(Dispatcher):
@@ -644,16 +688,23 @@ class FrameDispatcher(Dispatcher):
 
     def __init__(self, server, page: "PageDispatcher", frame_id: str,
                  url: str = "about:blank", name: str = "",
-                 load_states: Optional[List[str]] = None) -> None:
+                 load_states: Optional[List[str]] = None,
+                 parent_frame: Optional["FrameDispatcher"] = None) -> None:
         self.page = page
         self.frame_id = frame_id
+        self.parent_frame = parent_frame
         #: ⛔ Kept here because the INITIALIZER is a snapshot: the client reads
         #: the url from it once, at creation, and afterwards only from
         #: `navigated` events. A frame created before it navigates keeps an
         #: empty url forever unless something updates this.
         self.url = url
-        super().__init__(server, page.context,
+        #: Same reason, and both navigation events report it: a same-document
+        #: navigation carries no name, so it has to repeat the one the frame
+        #: already has rather than blank it.
+        self.name = name
+        super().__init__(server, page if parent_frame else page.context,
                          {"url": url, "name": name,
+                          "parentFrame": parent_frame.channel if parent_frame else None,
                           "loadStates": load_states or ["commit"]})
 
     # ── the engines, which belong to the page ───────────────────────────────
@@ -683,8 +734,8 @@ class FrameDispatcher(Dispatcher):
             params["url"], frame_id=self.frame_id,
             until=params.get("waitUntil") or "load",
             timeout=(params.get("timeout") or 30000) / 1000.0)
-        self.emit("navigated", {"url": result["url"], "name": "",
-                                "newDocument": {"request": None}})
+        # Navigation events come from the engine, not a snapshot taken when
+        # goto's lifecycle wait finished: another navigation may follow it.
         # ⛔ `goto` answers with a Response CHANNEL or null, never with a URL.
         # `_frame.py` calls `from_nullable_channel` on it.
         #
@@ -719,34 +770,30 @@ class FrameDispatcher(Dispatcher):
         if not object_id:
             raise ProtocolException("no element matches %r" % selector)
         try:
-            return {"value": read(object_id)}
+            return {"value": read(frame_id, object_id)}
         finally:
             self.injected.dispose(frame_id, object_id)
 
     def op_text_content(self, params: Dict) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .text_content(self.frame_id, o))
+        return self._with_element(params, self.injected.text_content)
 
     def op_inner_text(self, params: Dict) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .inner_text(self.frame_id, o))
+        return self._with_element(params, self.injected.inner_text)
 
     def op_inner_html(self, params: Dict) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .inner_html(self.frame_id, o))
+        return self._with_element(params, self.injected.inner_html)
 
     def op_input_value(self, params: Dict) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .input_value(self.frame_id, o))
+        return self._with_element(params, self.injected.input_value)
 
     def op_get_attribute(self, params: Dict) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .get_attribute(self.frame_id, o,
+        return self._with_element(params, lambda f, o: self.injected
+                                  .get_attribute(f, o,
                                                  params["name"]))
 
     def _state(self, params: Dict, state: str) -> Any:
-        return self._with_element(params, lambda o: self.injected
-                                  .element_state(self.frame_id, o, state))
+        return self._with_element(params, lambda f, o: self.injected
+                                  .element_state(f, o, state))
 
     def op_is_visible(self, params: Dict) -> Any:
         return self._state(params, "visible")
@@ -1002,14 +1049,16 @@ class FrameDispatcher(Dispatcher):
         # `matches = true` and narrows only on valueOrLabel / value / label /
         # index, so a plain string matches everything and picks the FIRST
         # option. Measured: ["b"] answered ['a'].
+        frame_id, selector = self.enter_frames(params["selector"])
         chosen = self.actions.select_option(
-            params["selector"], params.get("options") or [],
+            selector, params.get("options") or [], frame_id=frame_id,
             timeout=self._timeout(params), **self._act_opts(params))
         return {"values": chosen or []}
 
     def op_set_input_files(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
-        self.actions.set_input_files(selector, _upload_paths(params),
+        self.actions.set_input_files(selector,
+                                     _upload_paths(self.server, params),
                                      timeout=self._timeout(params),
                                      frame_id=frame_id,
                                      **self._act_opts(params))
@@ -1090,12 +1139,15 @@ class FrameDispatcher(Dispatcher):
         return None
 
     def op_wait_for_selector(self, params: Dict) -> Any:
+        frame_id, selector = self.enter_frames(params["selector"])
         state = params.get("state") or "visible"
         object_id = self.actions.wait_for_selector(
-            params["selector"], state=state, timeout=self._timeout(params))
+            selector, state=state, timeout=self._timeout(params),
+            frame_id=frame_id, strict=self._act_opts(params)["strict"])
         if object_id is None:
             return {"element": None}
-        handle = ElementHandleDispatcher(self.server, self, object_id)
+        handle = ElementHandleDispatcher(
+            self.server, self.page.frame_for(frame_id), object_id)
         return {"element": handle.channel}
 
     def op_wait_for_function(self, params: Dict) -> Any:
@@ -1158,7 +1210,7 @@ class FrameDispatcher(Dispatcher):
                 state = expression.split("to.be.", 1)[1]
                 return self._with_element(
                     {"selector": selector},
-                    lambda o: None) and {"matches": True}
+                    lambda f, o: None) and {"matches": True}
         except ProtocolException:
             return {"matches": False, "received": _serialize(None)}
         raise ProtocolException(
@@ -1177,8 +1229,8 @@ class FrameDispatcher(Dispatcher):
         if selector:
             return self._with_element(
                 params,
-                lambda o: self.injected.call(
-                    self.frame_id,
+                lambda f, o: self.injected.call(
+                    f,
                     "(injected, el, o) => injected.ariaSnapshot(el, o)",
                     {"objectId": o}, {"mode": params.get("mode") or "raw"}))
         return {"snapshot": self.injected.call(
@@ -1227,22 +1279,9 @@ class FrameDispatcher(Dispatcher):
             "caller holds")
 
     def op_resolve_selector(self, params: Dict) -> Any:
-        """The frame and selector a locator finally points at.
-
-        ⛔ It answers THIS frame and the selector unchanged, which is correct
-        only because frame-crossing locators are not supported here yet: an
-        `iframe >> internal:control=enter-frame >> ...` would resolve into a
-        child frame upstream. Answering this frame for one of those would be a
-        wrong answer rather than a missing feature, so the compound form is
-        refused.
-        """
-        selector = params.get("selector") or ""
-        if "enter-frame" in selector:
-            raise ProtocolException(
-                "a frame-crossing locator (%s) cannot be resolved yet: "
-                "answering this frame would be a wrong answer, not a missing "
-                "one" % selector[:80])
-        return {"frame": self.channel, "selector": selector}
+        """The frame and selector a locator finally points at."""
+        frame_id, selector = self.enter_frames(params.get("selector") or "")
+        return {"frame": self.page.frame_for(frame_id).channel, "selector": selector}
 
     def op_wait_for_element_state(self, params: Dict) -> Any:
         frame_id, selector = self.enter_frames(params["selector"])
@@ -1260,9 +1299,14 @@ class FrameDispatcher(Dispatcher):
 
     # ── frames as objects ───────────────────────────────────────────────────
     def op_frame_element(self, params: Dict) -> Any:
-        raise ProtocolException(
-            "frameElement needs the owner frame's handle, which this server "
-            "does not track yet")
+        parent = self.parent_frame
+        if parent is None:
+            raise ProtocolException("Frame has been detached or has no parent")
+        object_id = self.injected.adopt(self.frame_id, into=parent.frame_id)
+        if not object_id:
+            raise ProtocolException("Frame has been detached")
+        handle = ElementHandleDispatcher(self.server, parent, object_id)
+        return {"element": handle.channel}
 
     # ── selectors that answer many ──────────────────────────────────────────
     def op_query_count(self, params: Dict) -> Any:
@@ -1280,21 +1324,22 @@ class FrameDispatcher(Dispatcher):
     def op_eval_on_selector(self, params: Dict) -> Any:
         return self._with_element(
             params,
-            lambda o: _serialize(self.injected.call(
-                self.frame_id,
+            lambda f, o: _serialize(self.injected.call(
+                f,
                 "(injected, el) => { const r = (%s);"
                 "  return typeof r === 'function' ? r(el) : r; }"
                 % params["expression"],
                 {"objectId": o})))
 
     def op_eval_on_selector_all(self, params: Dict) -> Any:
+        frame_id, selector = self.enter_frames(params["selector"])
         value = self.injected.call(
-            self.frame_id,
+            frame_id,
             "(injected, sel) => { const els = injected.querySelectorAll("
             "  injected.parseSelector(sel), document);"
             "  const r = (%s); return typeof r === 'function' ? r(els) : r; }"
             % params["expression"],
-            params["selector"])
+            selector)
         return {"value": _serialize(value)}
 
     def op_evaluate_handle(self, params: Dict) -> Any:
@@ -1924,12 +1969,36 @@ class PageDispatcher(Dispatcher):
                 })
         elif method == "Page.navigationCommitted":
             child = self.frame_for(params["frameId"])
+            for state in ("commit", "domcontentloaded", "load", "networkidle"):
+                child.emit("loadstate", {"remove": state})
             child.url = params.get("url") or ""
+            child.name = params.get("name") or ""
             child.emit("navigated", {
                 "url": child.url,
-                "name": params.get("name") or "",
-                "newDocument": {"request": None},
+                "name": child.name,
+                "newDocument": self.navigation_document(params.get("navigationId")),
             })
+            child.emit("loadstate", {"add": "commit"})
+        elif method == "Page.sameDocumentNavigation":
+            # ⛔ THE CLIENT HAS TO HEAR THIS ONE TOO, and until 2026-09-20 it
+            # did not. A pushState, a hash change, the route change of every
+            # single-page application arrives as this event and not as a
+            # `navigationCommitted`; the lifecycle updated its own record of
+            # the frame's URL and nothing went up, so `page.url` kept the URL
+            # of the last full load and `wait_for_url` never resolved.
+            # Measured against a page that routes in the client: the fetch
+            # returned 200, the content changed, `location.href` changed, and
+            # `page.url` still named the previous document thirty seconds
+            # later - a click that worked, reported as a timeout.
+            #
+            # No `newDocument`: that key is how the client tells a full load
+            # from this, and `wait_for_navigation` reads `newDocument.request`
+            # to answer with a Response. There is no document here, so there
+            # is nothing to announce - the same shape upstream's
+            # `_onSameDocumentNavigation` sends.
+            child = self.frame_for(params["frameId"])
+            child.url = params.get("url") or ""
+            child.emit("navigated", {"url": child.url, "name": child.name})
 
     #: How many entries are kept. ⛔ A CAP, not a history: a page printing in
     #: a loop would exhaust the memory of the process DRIVING it, and a driver
@@ -1957,6 +2026,11 @@ class PageDispatcher(Dispatcher):
         index[request.navigation_id] = request
         while len(index) > PageDispatcher.LOG_LIMIT:
             del index[next(iter(index))]
+
+    def navigation_document(self, navigation_id: Optional[str]) -> Dict:
+        """The request field is optional, not nullable in Playwright's protocol."""
+        request = self._navigation_requests.get(navigation_id)
+        return {"request": request.channel} if request is not None else {}
 
     def navigation_response(self, navigation_id: Optional[str]) -> Any:
         """The Response CHANNEL for a finished navigation, or None.
@@ -2004,7 +2078,7 @@ class PageDispatcher(Dispatcher):
                 # Saying nothing loses the event; saying the wrong thing loses
                 # the trust in every event.
                 return
-            adopted = self.injected.adopt(frame_id, context_id, object_id)
+            adopted = self.injected.adopt(frame_id, object_id)
             if not adopted:
                 return
             frame = self.frame_for(frame_id)
@@ -2035,9 +2109,11 @@ class PageDispatcher(Dispatcher):
         if existing is not None:
             return existing
         frame = self.lifecycle.frame(frame_id)
+        parent_id = getattr(frame, "parent", None)
         made = FrameDispatcher(
             self.server, self, frame_id,
             url=getattr(frame, "url", "") or "",
+            parent_frame=self.frame_for(parent_id) if parent_id else None,
             load_states=sorted(getattr(frame, "states", []) or []) or ["commit"])
         self._frames[frame_id] = made
         return made
@@ -3521,6 +3597,34 @@ class JugglerServer(Server):
     #: direction that makes you write code twice.
     METHODS = {"initialize": "op_initialize"}
 
+    def stage_upload(self, payload: Dict) -> str:
+        """A `setInputFiles` payload written to a file, and that file's path.
+
+        Each payload gets a folder of its own, so the file keeps exactly the
+        name the caller gave it - that is the `File.name` the page reads -
+        and two payloads with the same name do not overwrite each other. The
+        name is reduced to its last component: a payload is content, and its
+        name must not choose where on this machine the content is written.
+
+        ⛔ THE FILES LIVE AS LONG AS THE SESSION, not as long as the call. A
+        page reads an uploaded file when it SUBMITS it, which can be minutes
+        after `set_input_files` returned; removing it at the end of the call
+        would leave the input holding a file that no longer exists.
+        """
+        name = os.path.basename((payload.get("name") or "").replace("\\", "/"))
+        if not name:
+            raise ProtocolException(
+                "a file payload needs a name: the page reads it as File.name")
+        root = getattr(self, "_upload_root", None)
+        if root is None:
+            root = tempfile.mkdtemp(prefix="invisible_upload_")
+            self._upload_root = root
+            self.on_shutdown(lambda: shutil.rmtree(root, ignore_errors=True))
+        path = os.path.join(tempfile.mkdtemp(dir=root), name)
+        with open(path, "wb") as out:
+            out.write(base64.b64decode(payload.get("buffer") or ""))
+        return path
+
     def handle_root(self, method: str, params: Dict) -> Any:
         name = self.METHODS.get(method)
         if name is None:
@@ -3540,7 +3644,6 @@ class JugglerServer(Server):
                          "utils": utils.channel},
             guid="Playwright")
         return {"playwright": playwright.channel}
-
 
 
 

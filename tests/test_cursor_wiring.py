@@ -141,13 +141,25 @@ class _FakeBrowser:
 _BOX = {"x": 400.0, "y": 300.0, "width": 100.0, "height": 40.0}
 
 
+class _HitChannel:
+    """The handle's wire. `checkHitTarget` is the only call the cursor makes
+    on it; the real server answers whether the point lands on the element."""
+
+    def __init__(self, hits=True):
+        self.hits = hits
+        self.sent = []
+
+    async def send(self, method, timeout_calculator=None, params=None, **kwargs):
+        self.sent.append((method, params))
+        return self.hits
+
+
 class _FakeHandle:
+    def __init__(self, hits=True):
+        self._channel = _HitChannel(hits)
+
     async def bounding_box(self):
         return dict(_BOX)
-
-    async def evaluate(self, expression, arg=None):
-        # The real one asks the page whether the point hits this element.
-        return True
 
     async def dispose(self):
         pass
@@ -847,15 +859,11 @@ def test_a_point_that_does_not_hit_the_element_is_not_used(stub_motion, monkeypa
     _cursor.enable_for(browser, seed=13, max_seconds=1.0)
     page = _FakePage(_FakeContext(browser))
 
-    class _Missing(_FakeHandle):
-        async def evaluate(self, expression, arg=None):
-            return False
-
     class _FakeFrame:
         _page = page
 
         async def query_selector(self, selector):
-            return _Missing()
+            return _FakeHandle(hits=False)
 
     captured = {}
 
@@ -864,6 +872,31 @@ def test_a_point_that_does_not_hit_the_element_is_not_used(stub_motion, monkeypa
 
     asyncio.run(_cursor._wrap_frame_action(original)(_FakeFrame(), "#buy"))
     assert "position" not in captured, "an unverified point reached the action"
+
+
+@pytest.mark.unit
+def test_the_landing_is_checked_by_the_server_in_the_box_s_own_space(
+        stub_motion, monkeypatch):
+    """The off-centre point goes to the server's `checkHitTarget` as it is, in
+    the main-frame space `bounding_box` answers in: the server shifts it into
+    the element's frame with the same arithmetic its own pre-commit check uses.
+    The cursor used to ask `document.elementFromPoint` itself, at those
+    main-frame coordinates, inside the element's document - wrong in every
+    nested frame and in every shadow root, so the landing always fell back to
+    the exact centre."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    handle = _FakeHandle()
+    frame = SimpleNamespace(query_selector=AsyncMock(return_value=handle))
+    cursor = SimpleNamespace(rng=lambda name: None)
+    monkeypatch.setattr(_cursor._behaviour, "landing_point",
+                        lambda *args, **kwargs: (410.0, 312.0))
+
+    aim = asyncio.run(_cursor._choose_landing(frame, cursor, "#buy", (), {}))
+    assert handle._channel.sent == [
+        ("checkHitTarget", {"point": {"x": 410.0, "y": 312.0}})]
+    assert aim.override["position"] == {"x": 10.0, "y": 12.0}
 
 
 @pytest.mark.unit
