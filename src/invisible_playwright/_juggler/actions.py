@@ -104,9 +104,13 @@ class Actions:
     #: without `__init__` still has one, and so that "no event sent yet" reads
     #: as 0 - the value that also means "the engine returned no id".
     _last_event_id = 0
+    #: The session's typing hand, or None when humanising is off. Class
+    #: defaults for the same reason as above: a bench that builds this object
+    #: without `__init__` gets "no rhythm", which is what None means.
+    typing_persona = None
 
-    def __init__(self, connection, session: str, lifecycle, injected,
-                 session_seed=None, motion_budget_s=None):
+    def __init__(self, connection, session: str, lifecycle, injected, *,
+                 acts, session_seed=None, motion_budget_s=None):
         self.c = connection
         self.session = session
         self.lifecycle = lifecycle
@@ -121,7 +125,7 @@ class Actions:
         #: what it meant: no rhythm, not a default one.
         self.session_seed = session_seed
         self.pointer_persona = None
-        typing_persona = None
+        self.typing_persona = None
         #: ⛔ THE ONE POINTER PATH THE CLIENT CANNOT DRAW. The client's cursor
         #: wrapper does "approach THEN act", which is every action except the
         #: drag: there the movement IS the action, it happens with the button
@@ -134,21 +138,27 @@ class Actions:
         if session_seed is not None:
             from .._behaviour import PointerPersona, TypingPersona, _sub_seed
             self.pointer_persona = PointerPersona.from_seed(session_seed)
-            typing_persona = TypingPersona.from_seed(session_seed)
+            self.typing_persona = TypingPersona.from_seed(session_seed)
             try:
                 from .._motion import CursorMotion
             except Exception:  # noqa: BLE001 - see `_cursor`: motion is optional
                 CursorMotion = None  # type: ignore[assignment]
             if CursorMotion is not None:
                 self.motion = CursorMotion(_sub_seed(session_seed, "server:drag"))
-        #: One stream per Actions, so two clicks in a session do not repeat the
-        #: same durations - the same reason the keyboard keeps one.
-        self._click_nonce = 0
+        #: ⛔ THE NONCE OF EVERY ACT OF THIS PAGE, and it is REQUIRED, not
+        #: defaulted. It carries the page's number in the session
+        #: (`_behaviour.SessionActs.page`), so two clicks, two fields or two
+        #: typed strings never draw the same durations, not even the first act
+        #: of two different tabs. Bare counters here restarted at 1 on every
+        #: page, and a default would bring that back for whoever forgot to
+        #: pass one. The keyboard and the drag draw from this same object.
+        self.acts = acts
         #: ⛔ A SINGLE keyboard per page, and that's the point: it holds
         #: the state of the modifiers. Building one per action would lose
         #: "Shift is down" between a `down` and the next key, and
         #: `Shift+a` would type `a`.
-        self.keyboard = Keyboard(connection, session, typing_persona)
+        self.keyboard = Keyboard(connection, session, self.typing_persona,
+                                 acts=acts)
         #: The last pointer position. Used by the wheel and by drag and
         #: drop, which start from where the mouse IS - not from 0,0.
         self.position = (0.0, 0.0)
@@ -781,12 +791,22 @@ class Actions:
 
     def press(self, selector: str, key: str, *, timeout: float = 30.0,
               frame_id: Optional[str] = None,
-              element_id: Optional[str] = None, **opts):
-        """`press`: focuses and presses, with the modifiers from the name."""
+              element_id: Optional[str] = None,
+              dwell_ms: Optional[float] = None, **opts):
+        """`press`: focuses and presses, with the modifiers from the name.
+
+        No typist's pause before the key, unlike `fill` and `type`: a press is
+        one key, most often sent to a field that already holds the focus
+        (Enter after typing), where there is no focus for a page to answer
+        and the wait between the two calls is the caller's.
+
+        `dwell_ms` is the caller's `delay`, how long the key stays down; None
+        leaves it to the session's hand, as `keyboard.press` does.
+        """
         def run(f, element, point):
             self.inj.call(f, "(injected, el) => injected.focusNode(el, true)",
                           {"objectId": element})
-            self.keyboard.press(key)
+            self.keyboard.press(key, dwell_ms=dwell_ms)
             return key
         return self._retry(selector, run,
                            states=["visible", "stable", "enabled"],
@@ -801,10 +821,14 @@ class Actions:
         ⛔ It isn't `fill`: that one replaces the content, this one
         appends to it. Swapping them is the easiest way to end up with
         `foobar` in a field that was meant to hold `bar`.
+
+        The typist's pause between the focus and the first key is the same
+        as `fill`'s, see `_reach_field`.
         """
+        deadline = time.monotonic() + timeout
+
         def run(f, element, point):
-            self.inj.call(f, "(injected, el) => injected.focusNode(el, true)",
-                          {"objectId": element})
+            self._reach_field(f, element, deadline)
             self.keyboard.type(text, delay_ms=delay)
             return text
         return self._retry(selector, run,
@@ -881,7 +905,11 @@ class Actions:
         # very pair this replaced. The client's walk drops it for the same
         # reason; found here by the browser arm, because in isolation there is
         # no preceding event for it to duplicate.
-        path = self.motion.path(x0, y0, to_point[0], to_point[1])[1:]
+        # ⛔ `index=`: the generator's own count lives on this page's
+        # instance and restarts with it, so the first drag of every tab drew
+        # the same curve. The page's act nonce numbers it across the session.
+        path = self.motion.path(x0, y0, to_point[0], to_point[1],
+                                index=self.acts.next("drag"))[1:]
         # ⛔ A curved path near an edge leaves the viewport on its own, and a
         # pointer event outside it is not ignored - the browser parks the cursor
         # at the origin, mid-movement. The destination is emitted unclamped: it
@@ -1034,8 +1062,8 @@ class Actions:
         if self.pointer_persona is None:
             return [(0.0, 0.0)] * clicks
         from .._behaviour import plan_click
-        self._click_nonce += 1
-        return plan_click(self.pointer_persona, clicks, nonce=self._click_nonce)
+        return plan_click(self.pointer_persona, clicks,
+                          nonce=self.acts.next("click"))
 
     def fill(self, selector: str, text: str, *, timeout: float = 30.0,
              frame_id: Optional[str] = None,
@@ -1049,10 +1077,16 @@ class Actions:
         events are missing. And those events are requested from
         `Page.dispatchTrustedInputEvents`, or they come out with
         `isTrusted: false`, which is the tell measured in [B175].
+
+        ⛔ AND THE FIRST KEY DOES NOT FOLLOW THE FOCUS IN THE SAME BREATH:
+        `_reach_field` stands between them, before the injected script
+        selects what the field holds, so what gets selected and replaced is
+        what the page left there once it had answered the focus.
         """
+        deadline = time.monotonic() + timeout
+
         def run(f, element, point):
-            self.inj.call(f, "(injected, el) => injected.focusNode(el, true)",
-                          {"objectId": element})
+            self._reach_field(f, element, deadline)
             result = self.inj.call(
                 f, "(injected, el, v) => injected.fill(el, v)",
                 {"objectId": element}, text)
@@ -1078,6 +1112,78 @@ class Actions:
                            states=["visible", "stable", "enabled",
                                    "editable"],
                            timeout=timeout, frame_id=frame_id, **opts)
+
+    #: What a field holds, for telling whether the page is still changing it.
+    #: `textContent` rather than `innerText` for editable content: the question
+    #: is only "did it change", and `innerText` would make the page lay itself
+    #: out for an answer `textContent` gives without.
+    _FIELD_TEXT_JS = (
+        "(injected, el) => {"
+        "  if (!el.isConnected) return 'error:notconnected';"
+        "  const e = injected.retarget(el, 'follow-label') || el;"
+        "  const n = e.nodeName.toLowerCase();"
+        "  return (n === 'input' || n === 'textarea') ? e.value : e.textContent; }")
+
+    def _reach_field(self, f, element, deadline: float) -> None:
+        """Focus a field, then wait the time a person takes before the first
+        key, and longer while the field visibly changes.
+
+        ⛔ A PERSON DOES NOT TYPE THE INSTANT A FIELD HAS THE FOCUS, AND PAGES
+        COUNT ON IT. `fill` and `type` focused and pressed the first key in
+        the same breath, a few milliseconds apart, which no hand does - and a
+        page that answers the focus a moment later (a store writing its stored
+        answer back, a formatter, a field loading its suggestions) then wrote
+        over what was already arriving. Measured by the MCP server on a real
+        form: "30" gone a second after it was typed, an email keeping only its
+        last letters. The server inserted a pause of its own in front of
+        `fill`, importing private names of this package to draw it; the pause
+        belongs to the action that types, and to every caller of it.
+
+        The pause is one hesitation of the session's typing persona
+        (`_behaviour.plan_hesitation`, act ``"field"``, one nonce per field
+        of the session, from `self.acts`),
+        and it starts again from every change the field shows, so a page still
+        answering the focus finishes before the first key. Bounded by the
+        action's own deadline: a field that never stops changing is typed into
+        when the time the caller gave the action is up, not waited on forever.
+
+        ⛔ NOTHING THE PAGE CAN SEE IS ADDED, ONLY TIME. The field is read in
+        the utility world, through the engine's own accessors, so a page that
+        wrapped `value` in its own world is not called, and a read fires no
+        event. What the page does not SHOW - a timer about to fire - cannot be
+        waited for by anybody.
+
+        No persona, no pause: humanising off keeps meaning no rhythm. And a
+        caller who passed `delay=` chose the interval between keys, not this.
+        """
+        def text():
+            got = self.inj.call(f, self._FIELD_TEXT_JS, {"objectId": element})
+            if got == "error:notconnected":
+                # Nothing has been typed yet, so starting over is free: the
+                # retry loop finds the field the page put in its place.
+                raise EvaluationError("field: error:notconnected")
+            return got
+
+        self.inj.call(f, "(injected, el) => injected.focusNode(el, true)",
+                      {"objectId": element})
+        if self.typing_persona is None:
+            return
+        from .._behaviour import plan_hesitation
+        pause = plan_hesitation(self.typing_persona, "field",
+                                self.acts.next("field")) / 1000.0
+        held = text()
+        still_since = time.monotonic()
+        while True:
+            now = time.monotonic()
+            left = min(still_since + pause, deadline) - now
+            if left <= 0:
+                return
+            # Read eight times per pause, so a change is seen within an eighth
+            # of it and the restarted pause is never late by more than that.
+            time.sleep(min(left, pause / 8))
+            seen = text()
+            if seen != held:
+                held, still_since = seen, time.monotonic()
 
     # ── the tools ───────────────────────────────────────────────────────────
     def _mouse_event(self, event_type: str, point, *, button: int = 0,

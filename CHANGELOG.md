@@ -8,7 +8,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.25.8] - 2026-10-02
 
+### Added
+- **`invisible_playwright.hesitation(seed, act, *, nonce=0, times=1)`**, the
+  session's pause before an act, in seconds, for an act this package does not
+  perform itself (answering a file chooser, say). It is drawn from the same
+  typing persona the keyboard uses, so it varies per session and per act, and
+  it returns 0 when `seed` is `None`. A caller that needed this used to import
+  private names of the package and copy the spread of a hesitation.
+
 ### Fixed
+- **`fill` and `press_sequentially` (`type`) wait a moment between the focus
+  and the first key.** They focused the field and pressed the first key a few
+  milliseconds later, which no hand does, and a page that answers the focus
+  a moment later (a store that writes its stored value back into the input,
+  a formatter, a field that loads its suggestions) wrote over the text that
+  was arriving: on a field whose store empties it 300, 600 or 900 ms after
+  the focus, an address kept only its last letters in 30 fills out of 30. With
+  humanising on, the session's typist now pauses for one of its hesitations,
+  starting again whenever the field changes, for no longer than the action's
+  timeout: the same 30 fills kept the address 10, 7 and 3 times out of 10,
+  each time the pause outlasted the store's timer, which nothing on the page
+  shows in advance. A fill takes a median 0.7 s longer. The page gets no new
+  event, only time, and the field is read from the utility world, where the
+  page cannot see the read. With humanising off nothing changes. The spread
+  of a hesitation is now one field of the typing persona, used by both
+  pauses.
+- **`delay` reaches the keyboard on `page.type`, `locator.type`,
+  `press_sequentially` and `press`.** `keyboard.type` and the element-handle
+  `type` honoured it; the selector operations accepted it and dropped it, so
+  `locator.type("abcd", delay=150)` went out 6, 10 and 22 ms apart, and
+  `locator.press(key, delay=300)` held the key for the session's own time.
+  For `type` it is the gap between two keys and for `press` how long the key
+  stays down, as Playwright documents both, and one reader takes it off the
+  wire for every key operation.
+- **Each tab of a session types, pauses and clicks with its own rhythm.** The
+  counters that tell two acts apart (the pause before a field, the intervals
+  between keys, how long a click is held, the curve of a drag) lived on each
+  page and started again with every new one, so with one seed the first
+  field of every tab waited the same pause and was typed with the same
+  intervals, and the first click of every tab was held for the same time.
+  Measured with seed 106 and three tabs: a pause of 2.14 to 2.16 s in all
+  three, keydown intervals within a few milliseconds of each other, and a
+  hold of 107 to 109 ms. The session now numbers its pages and every act
+  draws under its page's number, as the cursor already did for its paths:
+  the same three tabs pause 2.15, 0.83 and 1.08 s and type with intervals
+  that differ by as much as 274 ms. The same seed still replays the same
+  sequence, and the first tab of a session pauses, types and clicks exactly
+  as before.
 - **`expect_navigation()` and `wait_for_url()` no longer crash on a new
   document.** Every navigation event announced its document with a request
   of `None`, a value Playwright's protocol does not allow there, and the

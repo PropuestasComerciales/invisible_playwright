@@ -83,15 +83,22 @@ from __future__ import annotations
 
 import math
 import random
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Tuple)
 
 __all__ = [
     "Step",
     "PointerPersona",
     "TypingPersona",
     "plan_typing",
+    "plan_hesitation",
+    "hesitation",
     "plan_click",
+    "act_nonce",
+    "PageActs",
+    "SessionActs",
     "PlanStats",
     "initial_pointer",
     "landing_point",
@@ -144,6 +151,77 @@ def _sub_seed(seed: int, tag: str) -> int:
 
 def _rng(seed: int, tag: str, nonce: int = 0) -> random.Random:
     return random.Random(_sub_seed(seed, f"{tag}:{nonce}"))
+
+
+def act_nonce(page: int, n: int) -> int:
+    """The nonce of the `n`-th act of one kind on the session's `page`-th page.
+
+    The page goes in the high bits, so two pages never share a nonce and the
+    first page (0) keeps the plain count 1, 2, 3 that `hesitation` documents.
+    """
+    return (int(page) << 32) | (int(n) & 0xFFFFFFFF)
+
+
+class PageActs:
+    """Numbers the acts of one page, so no two acts of a session share a stream.
+
+    ⛔ THE COUNT RESTARTS PER PAGE, THE PAGE NUMBER DOES NOT. These counters
+    used to live as bare integers on each page's `Actions` and `Keyboard`, so
+    every new page started from nonce 1 again: with one seed, the first field
+    of every tab waited the same pause and was typed with the same intervals,
+    and the first click of every tab was held for the same time. A site that
+    sees two tabs of one session saw the same numbers twice. The page's
+    number, handed out once by the session (`SessionActs`), is now part of
+    every nonce, which is what the client's cursor already did with its page
+    ordinal (`_cursor.page_motion_seed`).
+
+    Reproducible: the same seed and the same acts in the same pages give the
+    same sequence. Per page rather than one count for the whole session for
+    the cursor's reason: a single count would make each tab's numbers depend
+    on how the acts of the tabs happened to interleave.
+    """
+
+    __slots__ = ("page", "_counts")
+
+    def __init__(self, page: int = 0) -> None:
+        self.page = int(page)
+        self._counts: Dict[str, int] = {}
+
+    def next(self, act: str) -> int:
+        """The nonce for the next act of kind `act` on this page."""
+        n = self._counts.get(act, 0) + 1
+        self._counts[act] = n
+        return act_nonce(self.page, n)
+
+
+class SessionActs:
+    """Hands each page of a session its number, 0, 1, 2, in the order asked.
+
+    Owned by whatever object IS the session, never by a module: a process can
+    hold two sessions. Two layers number their pages with it, each holding
+    its own: the server's `BrowserDispatcher`, for the acts it draws, and the
+    client cursor's `_cursor._Session`, for the paths it draws. They cannot
+    hold one object between them: the client's is keyed by the vendored
+    client's objects, which the server never sees, and the seed reaches the
+    server through the launch prefs for that same reason.
+    """
+
+    __slots__ = ("_pages", "_lock")
+
+    def __init__(self) -> None:
+        self._pages = 0
+        self._lock = threading.Lock()
+
+    def next_page(self) -> int:
+        """The next page's number."""
+        with self._lock:
+            n = self._pages
+            self._pages += 1
+        return n
+
+    def page(self) -> PageActs:
+        """The next page, ready to number its acts."""
+        return PageActs(self.next_page())
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -408,6 +486,19 @@ class TypingPersona:
     # distribution nobody produced.
     hesitation_rate: float
     hesitation_median_ms: float
+    # The spread of one hesitation, sigma of its log-normal. [judg] centred on
+    # the 0.55 every hesitation used to share as a literal inside
+    # `plan_typing`.
+    #
+    # ⛔ A FIELD, BECAUSE TWO PLACES DRAW A HESITATION: a pause in the middle
+    # of a word (`plan_typing`) and the pause between reaching a field and its
+    # first key (`plan_hesitation`). With the spread written at each call site
+    # the second one was a copy, and the first copy lived in another package,
+    # which imported private names of this module to repeat it.
+    #
+    # ⛔ DRAWN LAST, so every field above keeps the value it had for the same
+    # seed.
+    hesitation_sigma: float
 
     @classmethod
     def from_seed(cls, seed: int) -> "TypingPersona":
@@ -423,7 +514,16 @@ class TypingPersona:
             same_key_factor=r.uniform(1.25, 1.75),
             hesitation_rate=r.uniform(0.02, 0.07),
             hesitation_median_ms=r.uniform(420.0, 1250.0),
+            hesitation_sigma=r.uniform(0.40, 0.70),
         )
+
+    def hesitation_ms(self, rng: random.Random) -> float:
+        """One stop to think, in milliseconds, drawn from `rng`.
+
+        The only place a hesitation's distribution is written: `plan_typing`
+        and `plan_hesitation` both draw through here.
+        """
+        return _log_normal(rng, self.hesitation_median_ms, self.hesitation_sigma)
 
 
 def plan_click(persona: PointerPersona, clicks: int = 1,
@@ -484,9 +584,56 @@ def plan_typing(text: str, persona: TypingPersona,
                 gap *= (persona.alternate_hand_factor if a != b
                         else persona.same_hand_factor)
         if r.random() < persona.hesitation_rate:
-            gap += _log_normal(r, persona.hesitation_median_ms, 0.55)
+            gap += persona.hesitation_ms(r)
         out.append((dwell, gap))
     return out
+
+
+def plan_hesitation(persona: TypingPersona, act: str, nonce: int = 0,
+                    times: int = 1) -> float:
+    """How long this typist stops before `act`, in milliseconds: `times` of
+    its hesitations, drawn on the stream for `act` and `nonce`.
+
+    The same hand `plan_typing` pauses with in the middle of a word, so the
+    pause before a field and the pause inside it are one person's. Each act
+    has its own tagged stream, so adding an act cannot move a number another
+    act or the typing itself draws for the same seed; the nonce makes two acts
+    of the same kind in one session two different pauses.
+    """
+    r = _rng(persona.seed, act, nonce)
+    return sum(persona.hesitation_ms(r) for _ in range(max(1, times)))
+
+
+def hesitation(seed: Optional[int], act: str, *, nonce: int = 0,
+               times: int = 1) -> float:
+    """How long the person of session `seed` stops before an act, in SECONDS.
+
+    Public, for a caller that drives an act this package does not perform
+    itself and wants the pause before it to be the session's own: answering a
+    file chooser (find the file, confirm it), reading a page before replying.
+    It is drawn from the same typing persona the engine types with, so it
+    varies per session and per act and is no constant every install shares.
+
+    * `seed` is the session's seed, the one passed to `InvisiblePlaywright`.
+      `None` means humanising is off and returns 0.0: no rhythm, not a
+      default one.
+    * `act` names the kind of act, and each name is its own random stream:
+      the same seed, act and nonce always give the same pause.
+    * `nonce` tells two acts of the same kind apart; pass a counter the
+      caller keeps per session, not per page or per tab, or every new page
+      replays the first page's pauses.
+    * `times` sums that many hesitations, for an act made of several stops.
+
+    ``fill`` and ``press_sequentially`` (``type``) take this pause by
+    themselves between focusing a field and its first key, on the act
+    ``"field"`` with one nonce per field (`act_nonce`: 1, 2, 3 on the
+    session's first page, and every later page numbered apart from it); a
+    caller does not add one in front of them.
+    """
+    if seed is None:
+        return 0.0
+    return plan_hesitation(TypingPersona.from_seed(int(seed)), act,
+                           nonce, times) / 1000.0
 
 
 # ──────────────────────────────────────────────────────────────────────
