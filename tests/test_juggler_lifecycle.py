@@ -254,7 +254,9 @@ def test_the_inflight_counter_does_not_go_below_zero():
 
 def test_networkidle_wants_SILENCE_not_just_zero():
     c, v = lifecycle()
+    # A loaded document: networkidle implies load (see the class test).
     events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}),
            ("Network.requestWillBeSent", {"requestId": "R"}),
            ("Network.requestFinished", {"requestId": "R"}))
     assert v.inflight == 0
@@ -270,7 +272,9 @@ def test_networkidle_unblocks_by_TIMEOUT_not_by_an_event():
     until the next event, it would stay stuck in exactly the case it must
     succeed. Here no event arrives after the last one."""
     c, v = lifecycle()
+    # A loaded document: networkidle implies load (see the class test).
     events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}),
            ("Network.requestWillBeSent", {"requestId": "R"}),
            ("Network.requestFinished", {"requestId": "R"}))
     t0 = time.monotonic()
@@ -283,9 +287,20 @@ def test_networkidle_unblocks_by_TIMEOUT_not_by_an_event():
 def test_a_NULL_navigationId_is_not_an_error():
     """The protocol declares it Nullable: it happens when the navigation
     does not create a new document (an anchor). Waiting for a load there
-    would be a timeout on something that succeeded."""
+    would be a timeout on something that succeeded.
+
+    The engine's same-document event is what `goto` waits for instead, and
+    here it arrives BEFORE the command's reply, which must still count."""
     c, v = lifecycle({"Page.navigate": {"navigationId": None}})
     events(v, ("Page.frameAttached", {"frameId": "F1"}))
+    real_send = c.send
+
+    def send(method, params=None, session=None, timeout=30):
+        if method == "Page.navigate":
+            events(v, ("Page.sameDocumentNavigation",
+                       {"frameId": "F1", "url": "http://a/#x"}))
+        return real_send(method, params, session, timeout)
+    c.send = send
     result = v.goto("http://a/#x", timeout=1)
     assert result == {"navigationId": None, "url": "http://a/#x"}
 
@@ -366,3 +381,154 @@ def test_the_four_states_are_reached_on_a_real_page(firefox_binary):
         finally:
             c.close()
         srv.shutdown()
+
+
+def test_goto_networkidle_waits_for_ITS_OWN_document_not_the_quiet_old_one():
+    """⛔ The old page's silence must not satisfy the wait for the new one.
+
+    Measured on 2026-10-03: a production single-page login app loaded and went
+    quiet, then `goto(<another site>, wait_until="networkidle")` returned at
+    once with no Response while the browser was still on the old page, so a
+    caller reported a same-document navigation there. `navigationStarted` clears the states, and from then on
+    `follows()` accepts the frame, but networkidle read only the GLOBAL
+    request counter - zero, and quiet for seconds - so it was reached before
+    the new document's request had even been sent.
+    """
+    c, v = lifecycle({"Page.navigate": {"navigationId": "N1"}})
+    events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N0"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N0",
+                                         "url": "http://old/"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    time.sleep(IDLE_QUIET * 1.5)  # the old page has gone quiet
+
+    real_send = c.send
+
+    def send(method, params=None, session=None, timeout=30):
+        out = real_send(method, params, session, timeout)
+        if method == "Page.navigate":
+            # the browser starts ours; its document has not answered yet
+            events(v, ("Page.navigationStarted",
+                       {"frameId": "F1", "navigationId": "N1"}))
+        return out
+    c.send = send
+
+    with pytest.raises(TimeoutError) as e:
+        v.goto("http://new/", until="networkidle", timeout=IDLE_QUIET * 2)
+    assert "networkidle" in str(e.value)
+
+    # once ours commits and loads, and the network is quiet, it is reached
+    events(v, ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N1",
+                                            "url": "http://new/"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    v.wait_for_state("F1", "networkidle", navigation="N1",
+                     timeout=IDLE_QUIET * 4)
+    assert v.frames["F1"].url == "http://new/"
+
+
+@pytest.mark.parametrize("anchored", [True, False],
+                         ids=["anchored", "unanchored"])
+def test_networkidle_is_never_reached_on_a_document_that_has_not_loaded(anchored):
+    """The class behind the goto case above: networkidle is the last of the
+    four states, so it implies `load` the way `load` implies
+    `domcontentloaded`, and ONE definition says so, for every wait.
+
+    With the requirement written into `goto`'s anchored wait only, a second
+    definition of networkidle existed beside `_reached`, and an unanchored
+    wait during a navigation still read the old page's silence: states
+    cleared by `navigationStarted`, counter at zero, quiet for seconds.
+
+    Known-bad: answer networkidle from the request counter alone again, or
+    gate it on `load` for one kind of wait only.
+    """
+    c, v = lifecycle()
+    events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N0"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N0",
+                                         "url": "http://old/"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    time.sleep(IDLE_QUIET * 1.5)  # the old page has gone quiet
+    events(v, ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N1"}))
+    nav = {"navigation": "N1"} if anchored else {}
+
+    with pytest.raises(TimeoutError) as e:
+        v.wait_for_state("F1", "networkidle", timeout=IDLE_QUIET * 2, **nav)
+    assert "networkidle" in str(e.value)
+
+    events(v, ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N1",
+                                            "url": "http://new/"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    v.wait_for_state("F1", "networkidle", timeout=IDLE_QUIET * 4, **nav)
+
+
+def test_networkidle_is_born_once_and_announced_without_anyone_waiting():
+    """networkidle is a STATE of the document, born in one place and handed
+    to whoever listens, like `load`.
+
+    It used to exist only as a predicate evaluated inside `wait_for_state`, so
+    nothing could tell the client: the server never emitted
+    `loadstate {"add": "networkidle"}`, and `page.wait_for_load_state(
+    "networkidle")` - which waits for exactly that event - timed out on a
+    loaded, silent page. Measured on main 2026-10-04: load in 0.0 s,
+    networkidle TimeoutError at 5 s.
+
+    Known-bad: answer networkidle from a predicate inside the wait again, so
+    nobody hears it unless somebody is waiting.
+    """
+    c, v = lifecycle()
+    heard = []
+    v.announce = lambda what, frame_id, url=None: heard.append((what, frame_id))
+    events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N0"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N0",
+                                         "url": "http://a/"}),
+           ("Network.requestWillBeSent", {"requestId": "R"}),
+           ("Network.requestFinished", {"requestId": "R"}),
+           ("Page.eventFired", {"frameId": "F1", "name": "load"}))
+    time.sleep(IDLE_QUIET * 3)
+    assert heard == [("networkidle", "F1")], heard
+    assert "networkidle" in v.frames["F1"].states
+
+    # A later request does not take it back (Playwright fires it once per
+    # document); the next document does.
+    events(v, ("Network.requestWillBeSent", {"requestId": "R2"}))
+    assert "networkidle" in v.frames["F1"].states
+    events(v, ("Page.navigationStarted", {"frameId": "F1", "navigationId": "N1"}))
+    assert "networkidle" not in v.frames["F1"].states
+    assert heard == [("networkidle", "F1")], heard
+
+
+def test_a_same_document_goto_answers_after_the_engine_reports_it():
+    """Upstream Playwright's `goto`, for a navigation that creates no
+    document, waits for the frame's same-document navigation before it
+    answers, so the client has the new URL when `goto` returns.
+
+    This one answered the moment `Page.navigate` replied `navigationId: null`,
+    before `Page.sameDocumentNavigation` had arrived: `page.url` kept the old
+    URL until the NEXT call delivered the event. Measured on main 2026-10-04:
+    `goto(url + "#sec")` returned with `page.url == url`, and after a second
+    `goto(url + "#other")` it read `url + "#sec"` - one step behind.
+
+    Known-bad: return on a null navigationId without waiting, or announce the
+    URL after waking the waiter.
+    """
+    c, v = lifecycle({"Page.navigate": {"navigationId": None}})
+    events(v, ("Page.frameAttached", {"frameId": "F1"}),
+           ("Page.navigationCommitted", {"frameId": "F1", "navigationId": "N0",
+                                         "url": "http://a/"}))
+    order = []
+    v.announce = lambda what, frame_id, url=None: order.append((what, url))
+    real_send = c.send
+
+    def send(method, params=None, session=None, timeout=30):
+        out = real_send(method, params, session, timeout)
+        if method == "Page.navigate":
+            threading.Timer(0.2, events, (v, ("Page.sameDocumentNavigation", {
+                "frameId": "F1", "url": "http://a/#x"}))).start()
+        return out
+    c.send = send
+
+    result = v.goto("http://a/#x", timeout=5)
+    order.append(("returned", result["url"]))
+    assert order == [("sameDocument", "http://a/#x"),
+                     ("returned", "http://a/#x")], order
